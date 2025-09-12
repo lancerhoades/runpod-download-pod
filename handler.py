@@ -14,10 +14,10 @@ def resolve_storage_root() -> str:
     if os.path.isdir("/runpod-volume"):
         return "/runpod-volume"
     # Legacy fallbacks (some templates mount differently)
-    if os.path.isdir("/storage"):
-        return "/storage"
-    if os.path.isdir("/workspace"):
-        return "/workspace"
+    if os.path.isdir("/runpod-volume"):
+        return "/runpod-volume"
+    if os.path.isdir("/runpod-volume"):
+        return "/runpod-volume"
     raise RuntimeError(
         "No network volume found. On Serverless it should be at /runpod-volume. "
         "Attach a Network Volume in Endpoint > Advanced > Network Volume."
