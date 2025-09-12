@@ -4,6 +4,7 @@ import time
 import pathlib
 import requests
 import runpod
+VOLUME_PATH = os.getenv("RUNPOD_VOLUME_PATH", "/runpod-volume")
 
 VIMEO_API = "https://api.vimeo.com"
 VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")
