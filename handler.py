@@ -5,17 +5,22 @@ import time
 import pathlib
 import requests
 import runpod
+from typing import Optional, Callable
+from requests.exceptions import ReadTimeout, ConnectionError as ReqConnError
 
 # -------- Config --------
 VOLUME_PATH = os.getenv("RUNPOD_VOLUME_PATH", "/runpod-volume")
 VIMEO_API = "https://api.vimeo.com"
 VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")
 
-# Prefer ≤ this height (pick highest ≤ MAX_HEIGHT, else highest overall)
-MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "1080"))
-
-# Print a progress line every N MB
-PRINT_EVERY_MB = int(os.getenv("PRINT_EVERY_MB", "100"))
+# Tuning knobs (override via endpoint env if needed)
+MAX_HEIGHT        = int(os.getenv("MAX_HEIGHT", "1080"))   # prefer <= this height
+PRINT_EVERY_MB    = int(os.getenv("PRINT_EVERY_MB", "100"))
+DL_CHUNK_MB       = int(os.getenv("DL_CHUNK_MB", "4"))     # chunk size in MB
+DL_CONNECT_TO     = int(os.getenv("DL_CONNECT_TIMEOUT", "30"))
+DL_READ_TO        = int(os.getenv("DL_READ_TIMEOUT", "60"))  # per-chunk read timeout
+DL_MAX_RETRIES    = int(os.getenv("DL_MAX_RETRIES", "20"))
+DL_BACKOFF_FACTOR = float(os.getenv("DL_BACKOFF_FACTOR", "1.7"))
 
 def ensure_env():
     if not VIMEO_ACCESS_TOKEN:
@@ -78,29 +83,81 @@ def choose_best_mp4(video_json: dict):
         return under[0][2]
     return candidates[0][2]
 
-def stream_download(url: str, dest_path: str, chunk_bytes: int = 4 * 1024 * 1024):
-    # Give the read up to 5 minutes per chunk to avoid flaky stalls.
-    with requests.get(url, stream=True, timeout=(30, 300)) as r:
-        if r.status_code != 200:
-            raise RuntimeError(f"Download failed {r.status_code}: {r.text[:300]}")
-        total = int(r.headers.get("Content-Length", 0))
-        downloaded = 0
-        next_report = PRINT_EVERY_MB * 1024 * 1024
+def stream_download_resume(
+    url: str,
+    dest_path: str,
+    *,
+    refresh_url: Optional[Callable[[], str]] = None,
+    chunk_bytes: int = None,
+    connect_timeout: int = DL_CONNECT_TO,
+    read_timeout: int = DL_READ_TO,
+    max_retries: int = DL_MAX_RETRIES,
+    backoff_factor: float = DL_BACKOFF_FACTOR,
+) -> int:
+    """
+    Resumable download with HTTP Range, retries, and optional URL refresh.
+    """
+    chunk_bytes = chunk_bytes or (DL_CHUNK_MB * 1024 * 1024)
+    downloaded = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+    next_report = ((downloaded // (PRINT_EVERY_MB * 1024 * 1024)) + 1) * (PRINT_EVERY_MB * 1024 * 1024)
 
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_bytes):
-                if not chunk:
+    def _req(u: str, start: int):
+        headers = {"Accept-Encoding": "identity"}
+        if start > 0:
+            headers["Range"] = f"bytes={start}-"
+        return requests.get(u, stream=True, headers=headers, timeout=(connect_timeout, read_timeout))
+
+    retries = 0
+    while True:
+        try:
+            r = _req(url, downloaded)
+            if r.status_code == 416:
+                # Already fully downloaded
+                break
+            if r.status_code not in (200, 206):
+                # Possibly expired URL; try refresh if available
+                if r.status_code in (401, 403, 404, 410) and refresh_url and retries < max_retries:
+                    retries += 1
+                    sleep_s = backoff_factor ** retries
+                    print(f"[DL] Got {r.status_code}, refreshing URL (retry {retries}) after {sleep_s:.1f}s", flush=True)
+                    time.sleep(sleep_s)
+                    url = refresh_url()
                     continue
-                f.write(chunk)
-                downloaded += len(chunk)
-                if downloaded >= next_report:
-                    mb = downloaded // (1024 * 1024)
-                    print(f"[DL] {mb} MB downloaded...", flush=True)
-                    next_report += PRINT_EVERY_MB * 1024 * 1024
+                raise RuntimeError(f"Download HTTP {r.status_code}: {r.text[:300]}")
+
+            mode = "ab" if downloaded > 0 else "wb"
+            with open(dest_path, mode) as f:
+                for chunk in r.iter_content(chunk_size=chunk_bytes):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= next_report:
+                        mb = downloaded // (1024 * 1024)
+                        print(f"[DL] {mb} MB downloaded...", flush=True)
+                        next_report += PRINT_EVERY_MB * 1024 * 1024
+
+            # Completed this connection; if server closed cleanly we should be done.
+            # Verify if server gave Content-Range; if not, assume done.
+            # Most CDNs will have sent the remainder, so we can break.
+            break
+
+        except (ReadTimeout, ReqConnError) as e:
+            if retries >= max_retries:
+                raise RuntimeError(f"Download failed after {retries} retries: {e}")
+            retries += 1
+            sleep_s = backoff_factor ** retries
+            print(f"[DL] Stall/timeout, will resume from {downloaded} after {sleep_s:.1f}s (retry {retries})", flush=True)
+            time.sleep(sleep_s)
+            # Optionally refresh the URL each time we hit a network error
+            if refresh_url:
+                try:
+                    url = refresh_url()
+                except Exception as re:
+                    print(f"[DL] URL refresh failed, keeping old URL: {re}", flush=True)
+            continue
 
     size = os.path.getsize(dest_path)
-    if total and size != total:
-        print(f"[WARN] Content-Length={total}, wrote={size}", flush=True)
     return size
 
 def handler(event):
@@ -129,7 +186,15 @@ def handler(event):
     mp4_url = choose_best_mp4(vj)
     print(f"[INFO] Selected MP4: {mp4_url}", flush=True)
 
-    size = stream_download(mp4_url, out_path)
+    def refresh_url():
+        vj2 = vimeo_get(f"/videos/{vimeo_id}", fields=fields)
+        return choose_best_mp4(vj2)
+
+    size = stream_download_resume(
+        mp4_url,
+        out_path,
+        refresh_url=refresh_url
+    )
     print(f"[INFO] Finished download: {size} bytes -> {out_path}", flush=True)
 
     meta_dir = f"{VOLUME_PATH}/{job_id}/metadata"
