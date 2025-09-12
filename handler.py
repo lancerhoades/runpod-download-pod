@@ -8,13 +8,29 @@ import runpod
 VIMEO_API = "https://api.vimeo.com"
 VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")
 
-# -------- Helpers --------
+# --- Storage root detection (Serverless => /runpod-volume) ---
+def resolve_storage_root() -> str:
+    # Preferred for Serverless
+    if os.path.isdir("/runpod-volume"):
+        return "/runpod-volume"
+    # Legacy fallbacks (some templates mount differently)
+    if os.path.isdir("/storage"):
+        return "/storage"
+    if os.path.isdir("/workspace"):
+        return "/workspace"
+    raise RuntimeError(
+        "No network volume found. On Serverless it should be at /runpod-volume. "
+        "Attach a Network Volume in Endpoint > Advanced > Network Volume."
+    )
 
+STORAGE_ROOT = resolve_storage_root()
+
+# -------- Helpers --------
 def ensure_env():
     if not VIMEO_ACCESS_TOKEN:
         raise RuntimeError("VIMEO_ACCESS_TOKEN env var is required (set it in your RunPod template).")
-    if not os.path.isdir("/storage"):
-        raise RuntimeError("RunPod /storage is not mounted. Attach a Network Volume at /storage.")
+    if not os.path.isdir(STORAGE_ROOT):
+        raise RuntimeError(f"Storage root not available: {STORAGE_ROOT}")
 
 def mkdir_p(path: str):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
@@ -35,18 +51,13 @@ def vimeo_get(path: str, params=None, fields=None):
 
 def choose_best_mp4(video_json: dict):
     """
-    Vimeo returns either:
-      - 'download': list of downloadable files (often MP4)
-      - 'files': list with progressive or HLS variants
-
-    Strategy:
-      1) Prefer 'download' items with mp4-ish mime types
-      2) Else, prefer 'files' items with link and 'type'=='video/mp4'
-      3) Pick highest quality by 'height' or 'width' if available
+    Prefer progressive MP4:
+      1) 'download' list
+      2) 'files' list
+      Highest resolution first.
     """
     candidates = []
 
-    # 1) download[]
     for d in (video_json.get("download") or []):
         link = d.get("link")
         mime = (d.get("type") or "").lower()
@@ -55,7 +66,6 @@ def choose_best_mp4(video_json: dict):
         if link and ("mp4" in mime or mime == "" or "video/" in mime):
             candidates.append(("download", height or width, link))
 
-    # 2) files[]
     for f in (video_json.get("files") or []):
         link = f.get("link")
         mime = (f.get("type") or "").lower()
@@ -65,11 +75,10 @@ def choose_best_mp4(video_json: dict):
             candidates.append(("files", height or width, link))
 
     if not candidates:
-        raise RuntimeError("No progressive MP4 candidates found in Vimeo response (download/files missing or HLS-only).")
+        raise RuntimeError("No progressive MP4 candidates found in Vimeo response.")
 
-    # Highest resolution first
     candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates[0][2]  # return link
+    return candidates[0][2]
 
 def stream_download(url: str, dest_path: str, chunk_bytes: int = 5 * 1024 * 1024):
     with requests.get(url, stream=True, timeout=60) as r:
@@ -84,32 +93,27 @@ def stream_download(url: str, dest_path: str, chunk_bytes: int = 5 * 1024 * 1024
                     downloaded += len(chunk)
     size = os.path.getsize(dest_path)
     if total and size != total:
-        # Not all servers set a Content-Length; if present and mismatched, flag it.
         raise RuntimeError(f"Incomplete download: expected {total} bytes, got {size} bytes")
     return size
 
 # -------- RunPod handler --------
-
 def handler(event):
     """
     Input:
       {
-        "input": {
-          "job_id": "20250911-abc123-video42",
-          "vimeo_id": "123456789"
-        }
+        "job_id": "2025....-abc123",
+        "vimeo_id": "1114674380"
       }
     Output:
       {
         "ok": true,
-        "path": "/storage/{job_id}/raw/full.mp4",
+        "path": "/runpod-volume/{job_id}/raw/full.mp4",
         "bytes": 12345,
         "source_url": "https://...mp4"
       }
     """
     ensure_env()
-
-    payload = event.get("input") or {}
+    payload = (event.get("input") or {}) if isinstance(event, dict) else {}
     job_id = payload.get("job_id")
     vimeo_id = payload.get("vimeo_id") or payload.get("video_id")
 
@@ -118,23 +122,16 @@ def handler(event):
     if not vimeo_id:
         raise RuntimeError("Missing 'vimeo_id' (or 'video_id') in input.")
 
-    # Prepare paths
-    raw_dir = f"/storage/{job_id}/raw"
+    raw_dir = f"{STORAGE_ROOT}/{job_id}/raw"
     mkdir_p(raw_dir)
     out_path = f"{raw_dir}/full.mp4"
 
-    # Query Vimeo for direct MP4
-    # Limit fields to keep payload small/fast
     fields = "download.link,download.type,download.height,download.width,files.link,files.type,files.height,files.width,name,uri"
     vj = vimeo_get(f"/videos/{vimeo_id}", fields=fields)
-
     mp4_url = choose_best_mp4(vj)
-
-    # Download to /storage/{job_id}/raw/full.mp4
     size = stream_download(mp4_url, out_path)
 
-    # Minimal job metadata (you can expand later)
-    meta_dir = f"/storage/{job_id}/metadata"
+    meta_dir = f"{STORAGE_ROOT}/{job_id}/metadata"
     mkdir_p(meta_dir)
     job_json = {
         "job_id": job_id,
@@ -149,12 +146,6 @@ def handler(event):
     with open(f"{meta_dir}/job.json", "w", encoding="utf-8") as f:
         json.dump(job_json, f, ensure_ascii=False, indent=2)
 
-    return {
-        "ok": True,
-        "path": out_path,
-        "bytes": size,
-        "source_url": mp4_url
-    }
+    return {"ok": True, "path": out_path, "bytes": size, "source_url": mp4_url}
 
-# Start the serverless handler
 runpod.serverless.start({"handler": handler})
