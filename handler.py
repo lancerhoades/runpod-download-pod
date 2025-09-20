@@ -281,6 +281,8 @@ def handle(event):
         "s3_uri": f"s3://{AWS_S3_BUCKET}/{key}",
         "input_key": key,
         "s3_audio_url": url,
+        "video_url": url,
+        "s3_video_url": url,
         "audio_url": url,
         "console": _console_link(job_id)
     }
