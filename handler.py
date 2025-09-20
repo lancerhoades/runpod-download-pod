@@ -1,4 +1,4 @@
-import os, io, sys, json, time, uuid, tempfile, logging, mimetypes, re
+import os, io, sys, json, time, uuid, tempfile, logging, mimetypes, re, math
 import runpod
 import boto3
 from botocore.client import Config
@@ -11,10 +11,16 @@ AWS_S3_BUCKET      = os.getenv("AWS_S3_BUCKET")
 S3_PREFIX_BASE     = os.getenv("S3_PREFIX_BASE", "jobs")
 VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")  # required for private/managed Vimeo
 
+# Resume / logging tunables
+LOG_LEVEL             = os.getenv("LOG_LEVEL","INFO").upper()
+DOWNLOAD_CHUNK_MB     = int(os.getenv("DOWNLOAD_CHUNK_MB", "4"))       # per read
+DOWNLOAD_MAX_RETRIES  = int(os.getenv("DOWNLOAD_MAX_RETRIES","6"))     # retry attempts
+DOWNLOAD_PROGRESS_SEC = float(os.getenv("DOWNLOAD_PROGRESS_SEC","5"))  # progress log cadence
+
 if not AWS_S3_BUCKET:
     raise RuntimeError("AWS_S3_BUCKET env is required")
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, 20), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("download-pod")
 
 s3 = boto3.client("s3", region_name=AWS_REGION,
@@ -40,23 +46,6 @@ def _pick_ext(url_or_title: str, fallback="mp4") -> str:
             return ext
     return fallback
 
-def _download_direct(source_url: str, headers=None) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="dl_")
-    ext = _pick_ext(source_url)
-    dst = os.path.join(tmpdir, f"download-{uuid.uuid4().hex[:6]}.{ext}")
-    with requests.get(source_url, stream=True, timeout=None, headers=headers or {}) as r:
-        r.raise_for_status()
-        with open(dst, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1<<20):
-                if chunk:
-                    f.write(chunk)
-    return dst
-
-def _looks_like_streaming_site(url: str) -> bool:
-    return any(p in url.lower() for p in (
-        "youtube.com","youtu.be","vimeo.com","tiktok.com","facebook.com","x.com","twitter.com"
-    ))
-
 # ---------- Vimeo helpers ----------
 _VIMEO_ID_RX = re.compile(r"(?:vimeo\.com/(?:video/|manage/videos/)?)(\d+)")
 
@@ -68,9 +57,9 @@ def _vimeo_id_from(url_or_id: str|int|None):
     if m: return m.group(1)
     return s if s.isdigit() else None
 
-def _vimeo_get_best_file_url(vimeo_id: str) -> tuple[str,str]:
+def _vimeo_get_best_file_url(vimeo_id: str) -> tuple[str,str,dict]:
     """
-    Returns (download_url, suggested_filename). Requires VIMEO_ACCESS_TOKEN.
+    Returns (download_url, suggested_filename, headers_for_get).
     Prefers progressive mp4 (highest width), falls back to first file.
     """
     if not VIMEO_ACCESS_TOKEN:
@@ -84,21 +73,19 @@ def _vimeo_get_best_file_url(vimeo_id: str) -> tuple[str,str]:
         raise RuntimeError(f"Vimeo API {r.status_code}: {r.text[:500]}")
     data = r.json()
 
-    # Prefer progressive mp4 in 'files'
     files = data.get("files") or []
     best = None
     best_w = -1
     for f in files:
+        link = f.get("link")
+        if not link:
+            continue
         if f.get("type") == "video/mp4" or (f.get("mime_type") or "").startswith("video/"):
-            # progressive mp4 link often in 'link'
-            link = f.get("link")
-            if not link: continue
             w = f.get("width") or 0
             if w > best_w:
                 best_w = w
                 best = f
     if not best:
-        # Try 'download' array (older field)
         for d in (data.get("download") or []):
             link = d.get("link")
             if link:
@@ -109,20 +96,101 @@ def _vimeo_get_best_file_url(vimeo_id: str) -> tuple[str,str]:
 
     link = best.get("link")
     name = (data.get("name") or f"vimeo-{vimeo_id}") + ".mp4"
-    # Some links require auth header to GET; preserve headers
-    return link, name
+    # Some Vimeo file links require same Authorization header to GET the binary
+    get_headers = {"Authorization": f"Bearer {VIMEO_ACCESS_TOKEN}"}
+    return link, name, get_headers
 
+# ---------- Resumable downloader ----------
+def _head_for_size_etag(url: str, headers: dict|None) -> tuple[int|None, str|None, bool]:
+    """Return (content_length, etag, supports_range)."""
+    try:
+        r = requests.head(url, headers=headers or {}, timeout=30, allow_redirects=True)
+        cl = int(r.headers.get("Content-Length")) if r.headers.get("Content-Length") else None
+        et = r.headers.get("ETag")
+        ar = "bytes" in (r.headers.get("Accept-Ranges","").lower())
+        return cl, et, ar
+    except Exception:
+        return None, None, False
+
+def _resumable_download(url: str, dst: str, headers: dict|None=None):
+    """
+    Download with resume support:
+      - Use HEAD to discover length and Accept-Ranges
+      - If dst exists, continue from current size with Range
+      - Retries with exponential backoff
+      - Periodic progress logs (every DOWNLOAD_PROGRESS_SEC)
+    """
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    part = dst + ".part"
+    pos = os.path.getsize(part) if os.path.exists(part) else 0
+
+    total, etag, can_range = _head_for_size_etag(url, headers)
+    if total:
+        log.info(f"Remote size: {total/1e6:.1f} MB | Accept-Ranges={can_range} | ETag={etag}")
+
+    chunk = DOWNLOAD_CHUNK_MB * (1<<20)
+    attempts = 0
+    backoff = 1.0
+    t0 = time.time()
+    last_log = 0.0
+
+    while True:
+        try:
+            rng_headers = dict(headers or {})
+            if can_range and pos > 0:
+                rng_headers["Range"] = f"bytes={pos}-"
+            with requests.get(url, headers=rng_headers, stream=True, timeout=None, allow_redirects=True) as r:
+                if (can_range and pos > 0 and r.status_code not in (206, 200)) or (not can_range and r.status_code not in (200,)):
+                    raise RuntimeError(f"HTTP {r.status_code} for ranged GET")
+                mode = "ab" if (can_range and pos > 0) else "wb"
+                with open(part, mode) as f:
+                    for chunk_iter in r.iter_content(chunk_size=chunk):
+                        if not chunk_iter:
+                            continue
+                        f.write(chunk_iter)
+                        pos += len(chunk_iter)
+                        now = time.time()
+                        if now - last_log >= DOWNLOAD_PROGRESS_SEC:
+                            rate = (pos / max(1e-9, now - t0)) / 1e6
+                            if total:
+                                pct = (pos / total) * 100.0
+                                log.info(f"Downloading… {pos/1e6:.1f}/{total/1e6:.1f} MB ({pct:.1f}%) ~{rate:.1f} MB/s")
+                            else:
+                                log.info(f"Downloading… {pos/1e6:.1f} MB ~{rate:.1f} MB/s")
+                            last_log = now
+            # Completed
+            os.replace(part, dst)
+            # final log
+            elapsed = max(1e-9, time.time() - t0)
+            rate = (pos / elapsed) / 1e6
+            if total:
+                log.info(f"Done: {pos/1e6:.1f}/{total/1e6:.1f} MB in {elapsed:.1f}s (~{rate:.1f} MB/s)")
+            else:
+                log.info(f"Done: {pos/1e6:.1f} MB in {elapsed:.1f}s (~{rate:.1f} MB/s)")
+            return
+        except Exception as e:
+            attempts += 1
+            if attempts > DOWNLOAD_MAX_RETRIES:
+                raise RuntimeError(f"Download failed after {DOWNLOAD_MAX_RETRIES} retries: {e}")
+            log.warning(f"Download error ({e}); retry {attempts}/{DOWNLOAD_MAX_RETRIES} after {backoff:.1f}s, will resume at {pos/1e6:.1f} MB")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+def _download_direct_resumable(source_url: str, headers=None) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    ext = _pick_ext(source_url)
+    dst = os.path.join(tmpdir, f"download-{uuid.uuid4().hex[:6]}.{ext}")
+    _resumable_download(source_url, dst, headers=headers or {})
+    return dst
+
+# ---------- yt-dlp helper for non-Vimeo ----------
 def _download_with_ytdlp(source: str, prefer_audio=True, headers=None) -> tuple[str,str]:
-    """
-    Downloads the media to a temp file and returns (local_path, suggested_filename).
-    prefer_audio=True tries bestaudio first (no postprocessing), then falls back to best (video).
-    """
     tmpdir = tempfile.mkdtemp(prefix="dl_")
     base_out = os.path.join(tmpdir, "%(title).200B-%(id)s.%(ext)s")
     ydl_opts_common = {
         "outtmpl": base_out,
-        "quiet": True,
-        "noprogress": True,
+        "quiet": False if LOG_LEVEL=="DEBUG" else True,
+        "noprogress": False if LOG_LEVEL=="DEBUG" else True,
         "retries": 5,
         "http_headers": headers or {},
         "postprocessors": []
@@ -146,6 +214,12 @@ def _download_with_ytdlp(source: str, prefer_audio=True, headers=None) -> tuple[
     fpath, info = _run("best")
     return fpath, os.path.basename(fpath)
 
+def _looks_like_streaming_site(url: str) -> bool:
+    return any(p in url.lower() for p in (
+        "youtube.com","youtu.be","vimeo.com","tiktok.com","facebook.com","x.com","twitter.com"
+    ))
+
+# ---------- Handler ----------
 def handle(event):
     """
     Inputs:
@@ -177,16 +251,16 @@ def handle(event):
 
     log.info(f"[{job_id}] downloading: {source_url}")
 
-    # Vimeo first: use API with access token (more reliable than yt-dlp for private/manage links)
+    # Vimeo first: use API with access token (more reliable for private/manage links)
     vid = _vimeo_id_from(source_url) or _vimeo_id_from(vimeo_id)
     if vid:
         try:
-            link, suggested_name = _vimeo_get_best_file_url(vid)
-            headers = {"Authorization": f"Bearer {VIMEO_ACCESS_TOKEN}"} if VIMEO_ACCESS_TOKEN else {}
-            local_path = _download_direct(link, headers=headers)
+            link, suggested_name, get_headers = _vimeo_get_best_file_url(vid)
+            log.info(f"[{job_id}] Vimeo API resolved file: {suggested_name}")
+            local_path = _download_direct_resumable(link, headers=get_headers)
             suggested = suggested_name
         except Exception as e:
-            log.warning(f"Vimeo API path failed ({e}); falling back to yt-dlp.")
+            log.warning(f"[{job_id}] Vimeo API path failed ({e}); trying yt-dlp fallback.")
             headers = {"Authorization": f"Bearer {VIMEO_ACCESS_TOKEN}"} if VIMEO_ACCESS_TOKEN else {}
             local_path, suggested = _download_with_ytdlp(source_url, prefer_audio=True, headers=headers)
     else:
@@ -194,7 +268,7 @@ def handle(event):
         if _looks_like_streaming_site(source_url):
             local_path, suggested = _download_with_ytdlp(source_url, prefer_audio=True, headers={})
         else:
-            local_path = _download_direct(source_url)
+            local_path = _download_direct_resumable(source_url)
             suggested = os.path.basename(local_path)
 
     key = _s3_key(job_id, "inputs", suggested)
