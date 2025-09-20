@@ -1,7 +1,6 @@
-import os, io, sys, json, time, uuid, tempfile, logging, mimetypes, re, math
+import os, io, sys, json, time, uuid, tempfile, logging, mimetypes, re, math, subprocess
 import runpod
 import boto3
-import subprocess
 from botocore.client import Config
 import requests
 from yt_dlp import YoutubeDL
@@ -11,6 +10,7 @@ AWS_REGION         = os.getenv("AWS_REGION", "us-east-1")
 AWS_S3_BUCKET      = os.getenv("AWS_S3_BUCKET")
 S3_PREFIX_BASE     = os.getenv("S3_PREFIX_BASE", "jobs")
 VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")  # required for private/managed Vimeo
+SKIP_IF_EXISTS     = os.getenv("SKIP_IF_EXISTS", "true").lower() in ("1","true","yes")
 
 # Resume / logging tunables
 LOG_LEVEL             = os.getenv("LOG_LEVEL","INFO").upper()
@@ -37,16 +37,20 @@ def _presign(key: str, expires=7*24*3600) -> str:
                                      ExpiresIn=expires)
 
 def _console_link(job_id: str) -> str:
+    return (f"https://s3.console.aws.amazon.com/s3/buckets/{AWS_S3_BUCKET}"
+            f"?region={AWS_REGION}&prefix={S3_PREFIX_BASE}/{job_id}/&showversions=false")
+
 def _has_ffmpeg() -> bool:
     from shutil import which
     return which("ffmpeg") is not None
 
-
 def _extract_audio_mp3(src_path: str) -> str:
     dst = os.path.join(os.path.dirname(src_path), "audio.mp3")
-    subprocess.check_call(["ffmpeg","-y","-i", src_path, "-vn", "-acodec","libmp3lame","-b:a","128k", dst], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    subprocess.check_call(
+        ["ffmpeg","-y","-i", src_path, "-vn", "-acodec","libmp3lame","-b:a","128k", dst],
+        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
+    )
     return dst
-
 
 def _existing_inputs(job_id: str):
     """Return (video_key, audio_key) in S3 if already present under inputs/."""
@@ -62,16 +66,13 @@ def _existing_inputs(job_id: str):
     for obj in contents:
         k = obj.get("Key","")
         low = k.lower()
-        if (not audio_key) and low.endswith(audio_exts):
+        if (audio_key is None) and low.endswith(audio_exts):
             audio_key = k
-        if (not video_key) and (low.endswith(video_exts) and not low.endswith(audio_exts)):
+        if (video_key is None) and (low.endswith(video_exts) and not low.endswith(audio_exts)):
             video_key = k
     if not video_key and contents:
         video_key = contents[0].get("Key")
     return video_key, audio_key
-
-    return (f"https://s3.console.aws.amazon.com/s3/buckets/{AWS_S3_BUCKET}"
-            f"?region={AWS_REGION}&prefix={S3_PREFIX_BASE}/{job_id}/&showversions=false")
 
 def _pick_ext(url_or_title: str, fallback="mp4") -> str:
     url_or_title = url_or_title.lower()
@@ -148,11 +149,7 @@ def _head_for_size_etag(url: str, headers: dict|None) -> tuple[int|None, str|Non
 
 def _resumable_download(url: str, dst: str, headers: dict|None=None):
     """
-    Download with resume support:
-      - Use HEAD to discover length and Accept-Ranges
-      - If dst exists, continue from current size with Range
-      - Retries with exponential backoff
-      - Periodic progress logs (every DOWNLOAD_PROGRESS_SEC)
+    Download with resume support.
     """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     part = dst + ".part"
@@ -192,9 +189,7 @@ def _resumable_download(url: str, dst: str, headers: dict|None=None):
                             else:
                                 log.info(f"Downloading… {pos/1e6:.1f} MB ~{rate:.1f} MB/s")
                             last_log = now
-            # Completed
             os.replace(part, dst)
-            # final log
             elapsed = max(1e-9, time.time() - t0)
             rate = (pos / elapsed) / 1e6
             if total:
@@ -243,7 +238,7 @@ def _download_with_ytdlp(source: str, prefer_audio=True, headers=None) -> tuple[
             fpath, info = _run("bestaudio/best")
             return fpath, os.path.basename(fpath)
         except Exception as e:
-            log.warning(f"bestaudio failed: {e}; falling back to best")
+            log.warning(f"bestaudio failed: {e}); falling back to best")
 
     fpath, info = _run("best")
     return fpath, os.path.basename(fpath)
@@ -272,7 +267,7 @@ def handle(event):
     if not isinstance(payload, dict):
         payload = event or {}
 
-    job_id    = payload.get("job_id")
+    job_id     = payload.get("job_id")
     source_url = payload.get("source_url")
     vimeo_id   = payload.get("vimeo_id") or payload.get("video_id")
 
@@ -282,6 +277,28 @@ def handle(event):
         source_url = f"https://vimeo.com/{vimeo_id}"
     if not source_url:
         return {"error": "source_url or vimeo_id is required", "job_id": job_id}
+
+    # If inputs already exist, skip re-download
+    if SKIP_IF_EXISTS:
+        vkey, akey = _existing_inputs(job_id)
+        if vkey or akey:
+            log.info(f"[{job_id}] cache hit in s3://{AWS_S3_BUCKET}/{_s3_key(job_id,'inputs','')}")
+            video_key = vkey
+            audio_key = akey or vkey  # prefer audio if present
+            video_url = _presign(video_key) if video_key else None
+            audio_url = _presign(audio_key) if audio_key else None
+            out = {
+                "job_id": job_id,
+                "s3_uri": f"s3://{AWS_S3_BUCKET}/{video_key or audio_key}",
+                "input_key": video_key or audio_key,
+                "console": _console_link(job_id),
+                "video_url": video_url or audio_url,
+                "s3_video_url": video_url or audio_url,
+                "audio_url": audio_url or video_url,
+                "s3_audio_url": audio_url or video_url,
+            }
+            log.info(f"[{job_id}] returning cached URLs")
+            return out
 
     log.info(f"[{job_id}] downloading: {source_url}")
 
@@ -305,75 +322,44 @@ def handle(event):
             local_path = _download_direct_resumable(source_url)
             suggested = os.path.basename(local_path)
 
+    # Upload original file
     video_key = _s3_key(job_id, "inputs", suggested)
-
     log.info(f"[{job_id}] uploading original to s3://{AWS_S3_BUCKET}/{video_key}")
-
     s3.upload_file(local_path, AWS_S3_BUCKET, video_key)
-
     video_url = _presign(video_key)
 
-
-
+    # If it's a video and ffmpeg exists, extract mp3 for downstream pods
     lower_name = suggested.lower()
-
     is_video = lower_name.endswith((".mp4",".mov",".mkv",".webm",".avi"))
-
+    audio_key = None
     audio_url = None
 
-    audio_key = None
-
     if is_video and _has_ffmpeg():
-
         try:
-
             mp3_path = _extract_audio_mp3(local_path)
-
             audio_key = _s3_key(job_id, "inputs", "audio.mp3")
-
             log.info(f"[{job_id}] uploading extracted audio to s3://{AWS_S3_BUCKET}/{audio_key}")
-
             s3.upload_file(mp3_path, AWS_S3_BUCKET, audio_key)
-
             audio_url = _presign(audio_key)
-
         except Exception as e:
-
             log.warning(f"[{job_id}] audio extraction failed ({e}); returning video only")
-
-
-
-    if not is_video:
-
-        audio_key = video_key
-
-        audio_url = video_url
-
-
+    else:
+        # If it's already an audio file, reuse it
+        if not is_video:
+            audio_key = video_key
+            audio_url = video_url
 
     out = {
-
         "job_id": job_id,
-
         "s3_uri": f"s3://{AWS_S3_BUCKET}/{video_key}",
-
         "input_key": video_key,
-
         "console": _console_link(job_id),
-
         "video_url": video_url,
-
         "s3_video_url": video_url,
-
         "audio_url": audio_url or video_url,
-
         "s3_audio_url": audio_url or video_url
-
     }
-
     log.info(f"[{job_id}] done: {json.dumps(out)[:300]}")
-
     return out
-
 
 runpod.serverless.start({"handler": handle})
