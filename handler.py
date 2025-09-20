@@ -1,124 +1,155 @@
-import os, json, time, pathlib, subprocess, requests, runpod, boto3
+import os, io, sys, json, time, uuid, tempfile, logging, mimetypes, re
+import runpod
+import boto3
 from botocore.client import Config
+import requests
+from yt_dlp import YoutubeDL
 
-VOLUME_PATH = os.getenv("RUNPOD_VOLUME_PATH", "/runpod-volume")
-VIMEO_API   = "https://api.vimeo.com"
-VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")
+# -------- ENV --------
+AWS_REGION       = os.getenv("AWS_REGION", "us-east-1")
+AWS_S3_BUCKET    = os.getenv("AWS_S3_BUCKET")
+S3_PREFIX_BASE   = os.getenv("S3_PREFIX_BASE", "jobs")
+VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")  # optional
 
-AWS_REGION    = os.getenv("AWS_REGION", "us-east-1")
-AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")  # required for S3 upload
-S3_PREFIX     = os.getenv("S3_PREFIX_BASE", "jobs")
+if not AWS_S3_BUCKET:
+    raise RuntimeError("AWS_S3_BUCKET env is required")
 
-MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "1080"))
-PRINT_EVERY_MB = int(os.getenv("PRINT_EVERY_MB", "100"))
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+log = logging.getLogger("download-pod")
 
-s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(s3={"addressing_style":"virtual"}))
+s3 = boto3.client("s3", region_name=AWS_REGION,
+                  config=Config(s3={"addressing_style": "virtual"}))
 
-def ensure_env():
-    if not VIMEO_ACCESS_TOKEN:
-        raise RuntimeError("VIMEO_ACCESS_TOKEN is required.")
-    if not os.path.isdir(VOLUME_PATH):
-        raise RuntimeError(f"RunPod network volume missing at {VOLUME_PATH}. Attach a Network Volume to the endpoint.")
-    if not AWS_S3_BUCKET:
-        raise RuntimeError("AWS_S3_BUCKET is required to upload audio for transcription.")
+def _s3_key(job_id: str, *parts: str) -> str:
+    safe = [p.strip("/").replace("\\","/") for p in parts if p]
+    return "/".join([S3_PREFIX_BASE.strip("/"), job_id] + safe)
 
-def mkdir_p(p): pathlib.Path(p).mkdir(parents=True, exist_ok=True)
+def _presign(key: str, expires=7*24*3600) -> str:
+    return s3.generate_presigned_url("get_object",
+                                     Params={"Bucket": AWS_S3_BUCKET, "Key": key},
+                                     ExpiresIn=expires)
 
-def vimeo_get(path, params=None, fields=None):
-    headers = {"Authorization": f"bearer {VIMEO_ACCESS_TOKEN}",
-               "Accept": "application/vnd.vimeo.*+json;version=3.4"}
-    params = params or {}
-    if fields: params["fields"] = fields
-    r = requests.get(f"{VIMEO_API}{path}", headers=headers, params=params, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"Vimeo GET {r.status_code}: {r.text[:300]}")
-    return r.json()
+def _console_link(job_id: str) -> str:
+    return (f"https://s3.console.aws.amazon.com/s3/buckets/{AWS_S3_BUCKET}"
+            f"?region={AWS_REGION}&prefix={S3_PREFIX_BASE}/{job_id}/&showversions=false")
 
-def choose_best_mp4(vj):
-    cand = []
-    for d in (vj.get("download") or []):
-        link = d.get("link"); mime = (d.get("type") or "").lower()
-        h = d.get("height") or 0; w = d.get("width") or 0
-        if link and ("mp4" in mime or mime == "" or "video/" in mime): cand.append((h or w, h, link))
-    for f in (vj.get("files") or []):
-        link = f.get("link"); mime = (f.get("type") or "").lower()
-        h = f.get("height") or 0; w = f.get("width") or 0
-        if link and ("mp4" in mime or mime == "" or "video/" in mime): cand.append((h or w, h, link))
-    if not cand: raise RuntimeError("No progressive MP4 found.")
-    cand.sort(key=lambda x: x[0], reverse=True)
-    under = [c for c in cand if c[1] and c[1] <= MAX_HEIGHT]
-    return (under or cand)[0][2]
+def _pick_ext(url_or_title: str, fallback="mp4") -> str:
+    url_or_title = url_or_title.lower()
+    for ext in ("m4a","mp3","mp4","mkv","webm","wav","aac","flac","mov"):
+        if url_or_title.endswith("."+ext) or f".{ext}?" in url_or_title:
+            return ext
+    return fallback
 
-def stream_download(url, dst, chunk=4*1024*1024):
-    with requests.get(url, stream=True, timeout=(30, 600)) as r:
-        if r.status_code != 200:
-            raise RuntimeError(f"Download failed {r.status_code}: {r.text[:300]}")
-        downloaded = 0; next_report = PRINT_EVERY_MB*1024*1024
-        with open(dst,"wb") as f:
-            for ch in r.iter_content(chunk_size=chunk):
-                if not ch: continue
-                f.write(ch); downloaded += len(ch)
-                if downloaded >= next_report:
-                    print(f"[DL] {downloaded//(1024*1024)} MB...", flush=True)
-                    next_report += PRINT_EVERY_MB*1024*1024
-    return os.path.getsize(dst)
+def _download_with_ytdlp(source: str, prefer_audio=True, headers=None) -> tuple[str,str]:
+    """
+    Downloads the media to a temp file and returns (local_path, suggested_filename).
+    prefer_audio=True tries bestaudio first (no postprocessing), then falls back to best (video).
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    base_out = os.path.join(tmpdir, "%(title).200B-%(id)s.%(ext)s")
+    ydl_opts_common = {
+        "outtmpl": base_out,
+        "quiet": True,
+        "noprogress": True,
+        "retries": 5,
+        "http_headers": headers or {},
+        "postprocessors": []
+    }
 
-def make_audio(src_mp4, dst_mp3):
-    # 16 kHz mono 64 kbps MP3 (tiny but good for ASR)
-    cmd = ["ffmpeg","-hide_banner","-loglevel","error","-y",
-           "-i", src_mp4, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", dst_mp3]
-    subprocess.run(cmd, check=True)
-    return os.path.getsize(dst_mp3)
+    def _run(fmt):
+        opts = dict(ydl_opts_common)
+        if fmt: opts["format"] = fmt
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(source, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename, info
 
-def s3_key(job_id, name): return f"{S3_PREFIX}/{job_id}/inputs/{int(time.time())}-{name}"
-def s3_upload_and_presign(local, job_id):
-    key = s3_key(job_id, os.path.basename(local))
-    s3.upload_file(local, AWS_S3_BUCKET, key)
-    url = s3.generate_presigned_url("get_object",
-           Params={"Bucket": AWS_S3_BUCKET, "Key": key}, ExpiresIn=3600)
-    return key, url
+    if prefer_audio:
+        try:
+            fpath, info = _run("bestaudio/best")
+            return fpath, os.path.basename(fpath)
+        except Exception as e:
+            log.warning(f"bestaudio failed: {e}; falling back to best")
 
-def handler(event):
-    ensure_env()
-    payload = (event.get("input") or {}) if isinstance(event, dict) else {}
-    job_id = payload.get("job_id"); vimeo_id = payload.get("vimeo_id") or payload.get("video_id")
-    if not job_id:  raise RuntimeError("job_id required.")
-    if not vimeo_id:raise RuntimeError("vimeo_id (or video_id) required.")
+    fpath, info = _run("best")
+    return fpath, os.path.basename(fpath)
 
-    raw_dir = f"{VOLUME_PATH}/{job_id}/raw"; mkdir_p(raw_dir)
-    meta_dir = f"{VOLUME_PATH}/{job_id}/metadata"; mkdir_p(meta_dir)
-    mp4_path = f"{raw_dir}/full.mp4"
-    mp3_path = f"{raw_dir}/audio_16k_mono64k.mp3"
+def _download_direct(source_url: str) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    ext = _pick_ext(source_url)
+    dst = os.path.join(tmpdir, f"download-{uuid.uuid4().hex[:6]}.{ext}")
+    with requests.get(source_url, stream=True, timeout=None) as r:
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1<<20):
+                if chunk:
+                    f.write(chunk)
+    return dst
 
-    print(f"[INFO] job={job_id} vimeo={vimeo_id}", flush=True)
-    fields = "download.link,download.type,download.height,download.width,files.link,files.type,files.height,files.width,name,uri"
-    vj = vimeo_get(f"/videos/{vimeo_id}", fields=fields)
-    src = choose_best_mp4(vj)
-    print(f"[INFO] MP4: {src}", flush=True)
-    bytes_mp4 = stream_download(src, mp4_path)
-    print(f"[INFO] MP4 done: {bytes_mp4} bytes", flush=True)
+def _looks_like_streaming_site(url: str) -> bool:
+    return any(p in url.lower() for p in (
+        "youtube.com","youtu.be","vimeo.com","tiktok.com","facebook.com","x.com","twitter.com"
+    ))
 
-    bytes_mp3 = make_audio(mp4_path, mp3_path)
-    print(f"[INFO] MP3 done: {bytes_mp3} bytes", flush=True)
+def handle(event):
+    """
+    Inputs:
+      { "job_id": "...", "source_url": "https://...", "vimeo_id": "12345" }
+    Returns:
+      {
+        "job_id": "...",
+        "s3_uri": "s3://bucket/jobs/<job_id>/inputs/<filename>",
+        "input_key": "jobs/<job_id>/inputs/<filename>",
+        "audio_url": "https://<presigned>",
+        "s3_audio_url": "https://<presigned>",   # alias for back-compat with main.py
+        "console": "https://s3.console.aws.amazon.com/.../jobs/<job_id>/"
+      }
+    """
+    payload = event.get("input") if isinstance(event, dict) else None
+    if not isinstance(payload, dict):
+        payload = event or {}
 
-    key_mp3, audio_url = s3_upload_and_presign(mp3_path, job_id)
-    print(f"[INFO] S3 audio: s3://{AWS_S3_BUCKET}/{key_mp3}", flush=True)
+    job_id    = payload.get("job_id")
+    source_url = payload.get("source_url")
+    vimeo_id   = payload.get("vimeo_id") or payload.get("video_id")
 
-    with open(f"{meta_dir}/job.json","w",encoding="utf-8") as f:
-        json.dump({
-          "job_id": job_id, "vimeo_id": vimeo_id, "downloaded_at_utc": int(time.time()),
-          "raw_full_path": mp4_path, "bytes": bytes_mp4, "audio_mp3_path": mp3_path,
-          "audio_bytes": bytes_mp3, "audio_s3_bucket": AWS_S3_BUCKET, "audio_s3_key": key_mp3,
-          "audio_url": audio_url, "source_url": src, "video_uri": vj.get("uri"), "name": vj.get("name")
-        }, f, ensure_ascii=False, indent=2)
+    if not job_id:
+        raise ValueError("job_id is required")
+    if not source_url and vimeo_id:
+        source_url = f"https://vimeo.com/{vimeo_id}"
+    if not source_url:
+        return {"error": "source_url or vimeo_id is required", "job_id": job_id}
 
-    return {"ok": True,
-            "path": mp4_path,
-            "bytes": bytes_mp4,
-            "audio_path": mp3_path,
-            "audio_bytes": bytes_mp3,
-            "audio_s3_bucket": AWS_S3_BUCKET,
-            "audio_s3_key": key_mp3,
-            "audio_url": audio_url,
-            "source_url": src}
-runpod.serverless.start({"handler": handler})
+    log.info(f"[{job_id}] downloading: {source_url}")
+
+    headers = {}
+    if VIMEO_ACCESS_TOKEN and "vimeo.com" in source_url.lower():
+        headers["Authorization"] = f"Bearer {VIMEO_ACCESS_TOKEN}"
+
+    try:
+        if _looks_like_streaming_site(source_url):
+            local_path, suggested = _download_with_ytdlp(source_url, prefer_audio=True, headers=headers)
+        else:
+            local_path = _download_direct(source_url)
+            suggested = os.path.basename(local_path)
+    except Exception as e:
+        log.exception("Download failed")
+        return {"error": f"download failed: {e}", "job_id": job_id}
+
+    key = _s3_key(job_id, "inputs", suggested)
+    log.info(f"[{job_id}] uploading to s3://{AWS_S3_BUCKET}/{key}")
+    s3.upload_file(local_path, AWS_S3_BUCKET, key)
+    url = _presign(key)
+
+    out = {
+        "job_id": job_id,
+        "s3_uri": f"s3://{AWS_S3_BUCKET}/{key}",
+        "input_key": key,
+        "s3_audio_url": url,  # back-compat
+        "audio_url": url,
+        "console": _console_link(job_id)
+    }
+    log.info(f"[{job_id}] done: {json.dumps(out)[:300]}")
+    return out
+
+runpod.serverless.start({"handler": handle})
