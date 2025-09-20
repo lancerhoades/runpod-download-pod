@@ -6,10 +6,10 @@ import requests
 from yt_dlp import YoutubeDL
 
 # -------- ENV --------
-AWS_REGION       = os.getenv("AWS_REGION", "us-east-1")
-AWS_S3_BUCKET    = os.getenv("AWS_S3_BUCKET")
-S3_PREFIX_BASE   = os.getenv("S3_PREFIX_BASE", "jobs")
-VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")  # optional
+AWS_REGION         = os.getenv("AWS_REGION", "us-east-1")
+AWS_S3_BUCKET      = os.getenv("AWS_S3_BUCKET")
+S3_PREFIX_BASE     = os.getenv("S3_PREFIX_BASE", "jobs")
+VIMEO_ACCESS_TOKEN = os.getenv("VIMEO_ACCESS_TOKEN")  # required for private/managed Vimeo
 
 if not AWS_S3_BUCKET:
     raise RuntimeError("AWS_S3_BUCKET env is required")
@@ -39,6 +39,78 @@ def _pick_ext(url_or_title: str, fallback="mp4") -> str:
         if url_or_title.endswith("."+ext) or f".{ext}?" in url_or_title:
             return ext
     return fallback
+
+def _download_direct(source_url: str, headers=None) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    ext = _pick_ext(source_url)
+    dst = os.path.join(tmpdir, f"download-{uuid.uuid4().hex[:6]}.{ext}")
+    with requests.get(source_url, stream=True, timeout=None, headers=headers or {}) as r:
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1<<20):
+                if chunk:
+                    f.write(chunk)
+    return dst
+
+def _looks_like_streaming_site(url: str) -> bool:
+    return any(p in url.lower() for p in (
+        "youtube.com","youtu.be","vimeo.com","tiktok.com","facebook.com","x.com","twitter.com"
+    ))
+
+# ---------- Vimeo helpers ----------
+_VIMEO_ID_RX = re.compile(r"(?:vimeo\.com/(?:video/|manage/videos/)?)(\d+)")
+
+def _vimeo_id_from(url_or_id: str|int|None):
+    if url_or_id is None:
+        return None
+    s = str(url_or_id)
+    m = _VIMEO_ID_RX.search(s)
+    if m: return m.group(1)
+    return s if s.isdigit() else None
+
+def _vimeo_get_best_file_url(vimeo_id: str) -> tuple[str,str]:
+    """
+    Returns (download_url, suggested_filename). Requires VIMEO_ACCESS_TOKEN.
+    Prefers progressive mp4 (highest width), falls back to first file.
+    """
+    if not VIMEO_ACCESS_TOKEN:
+        raise RuntimeError("VIMEO_ACCESS_TOKEN not set; cannot fetch private Vimeo files.")
+
+    api = f"https://api.vimeo.com/videos/{vimeo_id}"
+    params = {"fields": "name,files,download"}
+    headers = {"Authorization": f"Bearer {VIMEO_ACCESS_TOKEN}"}
+    r = requests.get(api, headers=headers, params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Vimeo API {r.status_code}: {r.text[:500]}")
+    data = r.json()
+
+    # Prefer progressive mp4 in 'files'
+    files = data.get("files") or []
+    best = None
+    best_w = -1
+    for f in files:
+        if f.get("type") == "video/mp4" or (f.get("mime_type") or "").startswith("video/"):
+            # progressive mp4 link often in 'link'
+            link = f.get("link")
+            if not link: continue
+            w = f.get("width") or 0
+            if w > best_w:
+                best_w = w
+                best = f
+    if not best:
+        # Try 'download' array (older field)
+        for d in (data.get("download") or []):
+            link = d.get("link")
+            if link:
+                best = d
+                break
+    if not best:
+        raise RuntimeError("No downloadable file found via Vimeo API.")
+
+    link = best.get("link")
+    name = (data.get("name") or f"vimeo-{vimeo_id}") + ".mp4"
+    # Some links require auth header to GET; preserve headers
+    return link, name
 
 def _download_with_ytdlp(source: str, prefer_audio=True, headers=None) -> tuple[str,str]:
     """
@@ -74,23 +146,6 @@ def _download_with_ytdlp(source: str, prefer_audio=True, headers=None) -> tuple[
     fpath, info = _run("best")
     return fpath, os.path.basename(fpath)
 
-def _download_direct(source_url: str) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="dl_")
-    ext = _pick_ext(source_url)
-    dst = os.path.join(tmpdir, f"download-{uuid.uuid4().hex[:6]}.{ext}")
-    with requests.get(source_url, stream=True, timeout=None) as r:
-        r.raise_for_status()
-        with open(dst, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1<<20):
-                if chunk:
-                    f.write(chunk)
-    return dst
-
-def _looks_like_streaming_site(url: str) -> bool:
-    return any(p in url.lower() for p in (
-        "youtube.com","youtu.be","vimeo.com","tiktok.com","facebook.com","x.com","twitter.com"
-    ))
-
 def handle(event):
     """
     Inputs:
@@ -101,7 +156,7 @@ def handle(event):
         "s3_uri": "s3://bucket/jobs/<job_id>/inputs/<filename>",
         "input_key": "jobs/<job_id>/inputs/<filename>",
         "audio_url": "https://<presigned>",
-        "s3_audio_url": "https://<presigned>",   # alias for back-compat with main.py
+        "s3_audio_url": "https://<presigned>",
         "console": "https://s3.console.aws.amazon.com/.../jobs/<job_id>/"
       }
     """
@@ -122,19 +177,25 @@ def handle(event):
 
     log.info(f"[{job_id}] downloading: {source_url}")
 
-    headers = {}
-    if VIMEO_ACCESS_TOKEN and "vimeo.com" in source_url.lower():
-        headers["Authorization"] = f"Bearer {VIMEO_ACCESS_TOKEN}"
-
-    try:
-        if _looks_like_streaming_site(source_url):
+    # Vimeo first: use API with access token (more reliable than yt-dlp for private/manage links)
+    vid = _vimeo_id_from(source_url) or _vimeo_id_from(vimeo_id)
+    if vid:
+        try:
+            link, suggested_name = _vimeo_get_best_file_url(vid)
+            headers = {"Authorization": f"Bearer {VIMEO_ACCESS_TOKEN}"} if VIMEO_ACCESS_TOKEN else {}
+            local_path = _download_direct(link, headers=headers)
+            suggested = suggested_name
+        except Exception as e:
+            log.warning(f"Vimeo API path failed ({e}); falling back to yt-dlp.")
+            headers = {"Authorization": f"Bearer {VIMEO_ACCESS_TOKEN}"} if VIMEO_ACCESS_TOKEN else {}
             local_path, suggested = _download_with_ytdlp(source_url, prefer_audio=True, headers=headers)
+    else:
+        # Non-Vimeo
+        if _looks_like_streaming_site(source_url):
+            local_path, suggested = _download_with_ytdlp(source_url, prefer_audio=True, headers={})
         else:
             local_path = _download_direct(source_url)
             suggested = os.path.basename(local_path)
-    except Exception as e:
-        log.exception("Download failed")
-        return {"error": f"download failed: {e}", "job_id": job_id}
 
     key = _s3_key(job_id, "inputs", suggested)
     log.info(f"[{job_id}] uploading to s3://{AWS_S3_BUCKET}/{key}")
@@ -145,7 +206,7 @@ def handle(event):
         "job_id": job_id,
         "s3_uri": f"s3://{AWS_S3_BUCKET}/{key}",
         "input_key": key,
-        "s3_audio_url": url,  # back-compat
+        "s3_audio_url": url,
         "audio_url": url,
         "console": _console_link(job_id)
     }
